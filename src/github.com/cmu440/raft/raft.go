@@ -32,15 +32,19 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/cmu440/rpc"
 )
 
-const electionDelay = 300
-const electionDelayRandomizer = 10
-const heartbeatDelay = 20
+const (
+	electionDelay           = 500
+	electionDelayRandomizer = 100
+	heartbeatDelay          = 100
+	applyStateDelay         = 10
+)
 
 // ApplyCommand
 // ========
@@ -50,6 +54,12 @@ const heartbeatDelay = 20
 // tester) on the same server, via the applyCh passed to NewPeer()
 type ApplyCommand struct {
 	Index   int
+	Command interface{}
+}
+
+// Log entry struct
+type Entry struct {
+	Term    int
 	Command interface{}
 }
 
@@ -63,16 +73,28 @@ type Raft struct {
 	// Persistent
 	currentTerm int
 	votedFor    int
+	Log         []Entry
+
+	// Volatile
+	commitIndex int
+	lastApplied int
+
+	// Leader, reinitialized after each re-election
+	nextIndex  []int
+	matchIndex []int
 
 	// Custom state
 	isLeader    bool
 	receivedMsg bool
+	applyCh     chan ApplyCommand
 }
 
 // RequestVoteArgs: RequestVote RPC arguments structure
 type RequestVoteArgs struct {
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply: RequestVote RPC reply structure.
@@ -83,8 +105,12 @@ type RequestVoteReply struct {
 
 // AppendEntriesArgs: AppendEntries RPC arguments structure
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
 }
 
 // AppendEntriesReply: AppendEntries RPC reply structure.
@@ -123,30 +149,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// handle same term
-	if rf.currentTerm == args.Term {
-		if rf.votedFor == args.CandidateId {
-			rf.isLeader = false
-			rf.currentTerm = args.Term
-			rf.votedFor = args.CandidateId
-
-			reply.VoteGranted = true
-			rf.receivedMsg = true
-		} else {
-			reply.VoteGranted = false
-		}
+	// already voted for a different candidate
+	if rf.currentTerm == args.Term && rf.votedFor != args.CandidateId {
+		reply.VoteGranted = false
 		return
 	}
 
-	// convert to follower
-	if args.Term > rf.currentTerm {
-		rf.isLeader = false
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
+	lastIdx := len(rf.Log) - 1
+	lastTerm := rf.Log[lastIdx].Term
 
+	if args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx) {
 		reply.VoteGranted = true
 		rf.receivedMsg = true
+	} else {
+		reply.VoteGranted = false
 	}
+
+	rf.isLeader = false
+	rf.currentTerm = args.Term
+	rf.votedFor = args.CandidateId
 }
 
 // AppendEntries: AppendEntries RPC handler
@@ -156,7 +177,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 
-	// Reply false if term < currentTerm
+	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -168,9 +189,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	rf.receivedMsg = true
+
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	if args.PrevLogIndex >= len(rf.Log) || (args.PrevLogIndex >= 0 && rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.Success = false
+		return
+	}
 
 	reply.Success = true
-	rf.receivedMsg = true
+
+	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)
+	start := args.PrevLogIndex + 1
+	end := min(len(rf.Log), len(args.Entries)+start)
+
+	i := start
+	for ; i < end; i++ {
+		if rf.Log[i].Term != args.Entries[i-start].Term {
+			rf.Log = rf.Log[:i]
+			break
+		}
+	}
+
+	// 4. Append any new entries not already in the log
+	for ; i < len(args.Entries)+start; i++ {
+		rf.Log = append(rf.Log, args.Entries[i-start])
+	}
+
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.Log)-1)
+	}
 }
 
 // sendRequestVote
@@ -246,13 +295,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // The third return value is true if this server believes it is
 // the leader
 func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mux.Lock()
+	defer rf.mux.Unlock()
 
-	// TODO - Your code here (2B)
+	if !rf.isLeader {
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	rf.Log = append(rf.Log, Entry{rf.currentTerm, command})
+	rf.matchIndex[rf.me] = len(rf.Log) - 1
+	rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+
+	// index, term, isLeader
+	return rf.matchIndex[rf.me], rf.currentTerm, true
 }
 
 // Stop
@@ -265,7 +320,7 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 // in Stop(), but it might be convenient to (for example)
 // turn off debug output from this instance
 func (rf *Raft) Stop() {
-	// TODO - Your code here, if desired
+	// Do nothing
 }
 
 // NewPeer
@@ -293,15 +348,29 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 		peers: peers,
 		me:    me,
 
+		// Persistent
 		currentTerm: 0,
 		votedFor:    -1,
+		Log:         []Entry{{-1, 0}},
 
+		// Volatile
+		lastApplied: 0,
+		commitIndex: 0,
+
+		// Leader, reinitialized after each re-election
+		nextIndex:  make([]int, len(peers)),
+		matchIndex: make([]int, len(peers)),
+
+		// Custom state
 		isLeader:    false,
 		receivedMsg: false,
+		applyCh:     applyCh,
 	}
 
+	// spin off goroutines for elections, heartbeats and applying state
 	go rf.electionScheduler()
 	go rf.heartbeatScheduler()
+	go rf.applyStateScheduler()
 
 	return rf
 }
@@ -332,6 +401,25 @@ func (rf *Raft) heartbeatScheduler() {
 
 		// send heartbeat (append entries RPC)
 		rf.heartbeatSender()
+	}
+}
+
+// scheduler to apply state (at fixed intervals)
+func (rf *Raft) applyStateScheduler() {
+	for {
+		time.Sleep(time.Duration(applyStateDelay) * time.Millisecond)
+
+		rf.mux.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+
+			applyCmd := ApplyCommand{
+				Index:   rf.lastApplied,
+				Command: rf.Log[rf.lastApplied].Command,
+			}
+			rf.applyCh <- applyCmd
+		}
+		rf.mux.Unlock()
 	}
 }
 
@@ -371,9 +459,12 @@ func (rf *Raft) sendVote(server int, numVotes *int, term int) {
 	}
 
 	// create args struct
-	args := RequestVoteArgs{}
-	args.Term = rf.currentTerm
-	args.CandidateId = rf.me
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.Log) - 1,
+		LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+	}
 	rf.mux.Unlock()
 
 	// send vote
@@ -403,6 +494,11 @@ func (rf *Raft) sendVote(server int, numVotes *int, term int) {
 		// become leader (consensus reached)
 		if *numVotes == 1+len(rf.peers)/2 {
 			rf.isLeader = true
+
+			for i := range rf.peers {
+				rf.nextIndex[i] = len(rf.Log)
+				rf.matchIndex[i] = 0
+			}
 
 			// leader sends heartbeat to all servers
 			rf.mux.Unlock()
@@ -442,7 +538,14 @@ func (rf *Raft) sendHeartbeat(server int) {
 	}
 
 	// create args struct
-	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[server] - 1,
+		PrevLogTerm:  rf.Log[rf.nextIndex[server]-1].Term,
+		Entries:      append([]Entry(nil), rf.Log[rf.nextIndex[server]:]...),
+		LeaderCommit: rf.commitIndex,
+	}
 	rf.mux.Unlock()
 
 	// send heartbeat
@@ -457,6 +560,28 @@ func (rf *Raft) sendHeartbeat(server int) {
 		rf.votedFor = -1
 		rf.mux.Unlock()
 		return
+	}
+
+	if !rf.isLeader {
+		rf.mux.Unlock()
+		return
+	}
+
+	if reply.Success {
+		rf.nextIndex[server] = max(len(args.Entries)+args.PrevLogIndex+1, rf.nextIndex[server])
+
+		rf.matchIndex[server] = max(len(args.Entries)+args.PrevLogIndex, rf.matchIndex[server])
+
+		indices := append([]int(nil), rf.matchIndex...)
+		sort.Sort(sort.Reverse(sort.IntSlice(indices)))
+
+		newCommitIndex := indices[len(rf.peers)/2]
+		if newCommitIndex > rf.commitIndex && rf.Log[newCommitIndex].Term == rf.currentTerm {
+			rf.commitIndex = newCommitIndex
+		}
+	} else {
+		diff := max(len(rf.Log)-1-rf.nextIndex[server], 1)
+		rf.nextIndex[server] = max(len(rf.Log)-(2*diff), 1)
 	}
 
 	rf.mux.Unlock()
